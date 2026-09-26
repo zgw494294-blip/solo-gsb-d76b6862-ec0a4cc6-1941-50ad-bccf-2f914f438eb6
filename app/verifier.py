@@ -114,6 +114,18 @@ class Invoice:
     total_amount: int     # TDS01，整数分（等于各行整数分之和）
 
 
+@dataclass(frozen=True)
+class Envelope:
+    """ISA 外壳解析结果：分隔符、ISA 各元素与切段（997 回执生成复用）。"""
+
+    element_sep: str
+    component_sep: str
+    segment_term: str
+    isa_fields: list[str]                        # ["ISA", ISA01..ISA16]
+    segments: list[tuple[int, str, list[str]]]   # (段序号, 段标识, 元素)，ISA=1
+    trailing_data: Optional[str]                 # IEA 终止符之后的多余数据
+
+
 def _err(
     code: str,
     message: str,
@@ -134,8 +146,12 @@ def _min_len(tag: str, fields: list[str], n: int, seg_idx: int) -> None:
         )
 
 
-def verify(edi_text: str) -> Invoice:
-    """核验一份 X12 810 报文；失败抛 X12Error，成功返回 Invoice。"""
+def parse_envelope(edi_text: str, *, check_isa12: bool = True) -> Envelope:
+    """解析 ISA 外壳、分隔符并切段；失败抛 X12Error。
+
+    check_isa12=False 时跳过 ISA12 版本检查（997 回执的外壳扫描用：
+    版本错误属于核验失败，不妨碍外壳本身的解析）。
+    """
 
     raw = edi_text.encode("latin-1", errors="replace")  # 调用方已完成 ASCII 校验
     if not raw:
@@ -177,11 +193,9 @@ def verify(edi_text: str) -> Invoice:
     if any(f == "" for f in isa_fields):
         raise _err("ISA_MALFORMED", "ISA 段不允许空元素")
 
-    if isa_fields[12] != "00401":  # ISA12 互换版本号
+    if check_isa12 and isa_fields[12] != "00401":  # ISA12 互换版本号
         raise _err("ISA12_BAD_VERSION",
                    f'ISA12 必须为 "00401"，实际为 {isa_fields[12]!r}', 1, "ISA")
-
-    isa_ctrl = isa_fields[13]      # ISA13 交换控制号
 
     # ---- 切段 ---------------------------------------------------------
     remainder = raw[106:].decode("ascii", errors="replace")
@@ -209,6 +223,24 @@ def verify(edi_text: str) -> Invoice:
         if tag == "":
             raise _err("EMPTY_SEGMENT", "缺少段标识", i)
         segments.append((i, tag, fields))
+
+    return Envelope(
+        element_sep=element_sep,
+        component_sep=component_sep,
+        segment_term=segment_term,
+        isa_fields=isa_fields,
+        segments=segments,
+        trailing_data=trailing_data,
+    )
+
+
+def verify(edi_text: str) -> Invoice:
+    """核验一份 X12 810 报文；失败抛 X12Error，成功返回 Invoice。"""
+
+    env = parse_envelope(edi_text)
+    isa_ctrl = env.isa_fields[13]  # ISA13 交换控制号
+    segments = env.segments
+    trailing_data = env.trailing_data
 
     # ---- 外壳顺序状态机 -------------------------------------------------
     state = "GS"

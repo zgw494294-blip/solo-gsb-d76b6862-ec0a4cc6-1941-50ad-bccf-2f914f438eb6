@@ -1,4 +1,4 @@
-"""X12 810 发票核验与采购单核销 HTTP API。"""
+"""X12 810 发票核验、采购单核销与 997 回执 HTTP API。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .acknowledger import AckError, acknowledge
 from .reconciler import (
     MAX_EDI_TEXTS,
     OrderError,
@@ -19,9 +20,9 @@ from .verifier import X12Error, verify_text
 
 app = FastAPI(
     title="X12 810 Invoice Verification API",
-    version="1.1.0",
+    version="1.2.0",
     description="核验 ASC X12 004010 单份 810 发票报文的外壳结构与发票金额，"
-                "并按采购单对多份发票逐张核销。",
+                "按采购单对多份发票逐张核销，并对单份发票生成 997 功能确认回执。",
 )
 
 
@@ -59,6 +60,14 @@ async def x12_error_handler(_request, exc: X12Error) -> JSONResponse:
 
 @app.exception_handler(OrderError)
 async def order_error_handler(_request, exc: OrderError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(AckError)
+async def ack_error_handler(_request, exc: AckError) -> JSONResponse:
     return JSONResponse(
         status_code=422,
         content={"error": {"code": exc.code, "message": exc.message}},
@@ -163,6 +172,32 @@ async def reconcile_invoices(req: ReconcileRequest) -> ReconcileResponse:
             for line_id, milli in outcome.remaining
         ],
     )
+
+
+# ---------- POST /v1/acknowledge ----------
+
+
+class AcknowledgeRequest(BaseModel):
+    edi_text: str = Field(..., description="完整 X12 810 报文（ASCII，≤64 KiB）")
+    isa13: str = Field(..., description="回执 ISA13 交换控制号（九位数字）")
+    gs06: str = Field(..., description="回执 GS06 组控制号（非空）")
+    st02: str = Field(..., description="回执 ST02 交易集控制号（非空）")
+
+
+class AcknowledgeResponse(BaseModel):
+    accepted: bool = Field(
+        ..., description="来报是否通过发票核验（对应 997 中 AK5/AK9 的 A/R）")
+    ack_edi: str = Field(..., description="004010 X12 997 回执报文")
+
+
+@app.post(
+    "/v1/acknowledge",
+    response_model=AcknowledgeResponse,
+    summary="对一份 X12 810 报文生成 997 功能确认回执",
+)
+async def acknowledge_invoice(req: AcknowledgeRequest) -> AcknowledgeResponse:
+    ack_edi, accepted = acknowledge(req.edi_text, req.isa13, req.gs06, req.st02)
+    return AcknowledgeResponse(accepted=accepted, ack_edi=ack_edi)
 
 
 @app.get("/health", summary="存活探针")
