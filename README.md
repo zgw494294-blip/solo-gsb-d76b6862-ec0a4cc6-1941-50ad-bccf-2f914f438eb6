@@ -9,6 +9,9 @@
 逐张核销（逐张核验、行号/单价比对、数量累计），返回逐张接受状态与各采购单行
 剩余数量。
 
+另提供 `POST /v1/acknowledge`：接收单份 810 报文与回执控制号，返回
+ASC X12 004010 **997 功能回执**（Functional Acknowledgment）报文。
+
 ## 单条命令启动
 
 需要 Docker（含 Compose 插件）：
@@ -20,6 +23,7 @@ docker compose up --build -d
 - 服务地址：`http://localhost:8080`
 - 核验接口：`POST http://localhost:8080/v1/verify`
 - 核销接口：`POST http://localhost:8080/v1/reconcile`
+- 回执接口：`POST http://localhost:8080/v1/acknowledge`
 - 健康检查：`GET http://localhost:8080/health`
 - 交互文档（Swagger UI）：`http://localhost:8080/docs`
 
@@ -165,6 +169,72 @@ curl -s http://localhost:8080/v1/reconcile \
   }'
 ```
 
+## 请求 / 响应（POST /v1/acknowledge）
+
+对**单份** 810 报文生成 ASC X12 004010 **997 功能回执**。
+
+请求体（JSON）：
+
+```json
+{
+  "edi_text": "ISA*00*          *00*          *...810 报文...",
+  "isa13": "000000002",
+  "gs06": "43",
+  "st02": "0002"
+}
+```
+
+- `isa13`：回执 ISA13 交换控制号，**恰好 9 位数字**；
+- `gs06` / `st02`：回执 GS06 组控制号 / ST02 交易集控制号，**非空**，且不得
+  包含来报分隔符或控制字符。
+
+成功 `200`，`edi_text` 为完整 997 报文：
+
+```json
+{
+  "edi_text": "ISA*00*          *00*          *ZZ*RECEIVER1234567*ZZ*SENDER123456789*000830*1200*U*00401*000000002*0*P*:~GS*FA*RECVGS*SENDERGS*20200830*1200*43*X*004010~ST*997*0002~AK1*IN*42~AK2*810*0001~AK5*A~AK9*A*1~SE*6*0002~GE*1*43~IEA*1*000000002~"
+}
+```
+
+### 回执生成规则
+
+1. **仅当来报外壳可回执时才生成 997**：ISA 可解析（106 字节、分隔符合法、
+   `ISA12=00401`）、恰为一份交换/功能组/交易集且含 `SE`/`GE`/`IEA` 结束段、
+   收发方（ISA05/06、ISA07/08）及 `GS06`/`ST02` 可提取（`GS08=004010`、
+   `ST01=810`）。否则返回 `422`，错误体**原样带回来报核验的错误码**
+   （如 `MISSING_SEGMENT`、`TRAILING_DATA`、`NOT_ASCII` 等）。
+2. **A/R 复用现有发票核验**（与 `/v1/verify` 完全相同的规则）：
+   - 核验通过：`AK5*A`、`AK9*A*1`（接收数为 1），不输出 AK3；
+   - 核验失败：`AK5*R`、`AK9*R*0`（接收数为 0）；错误可定位到段时输出
+     `AK3*<段标识>*<位置>`，位置**从 ST 起算**（ST = 1，如 TDS 段为 4）。
+3. **回执外壳**：沿用来报的元素/组件/段终止符；ISA 与 GS 的收发方**互换**
+   （ISA05/06 ↔ ISA07/08、GS02 ↔ GS03），`AK1` 引用来报 `GS01`/`GS06`，
+   `AK2` 引用 `810` 与来报 `ST02`；回执自身的 `ST02=SE02`、`GS06=GE02`、
+   `ISA13=IEA02` 两两配对，`SE01` 段数与 `GE01`/`IEA01`（均为 1）计数自洽。
+
+### 回执错误码（422）
+
+| code | 含义 |
+| --- | --- |
+| `ACK_ISA13_INVALID` | 回执 ISA13 不是恰好 9 位数字 |
+| `ACK_GS06_EMPTY` / `ACK_ST02_EMPTY` | 回执 GS06 / ST02 为空 |
+| `ACK_GS06_INVALID` / `ACK_ST02_INVALID` | 回执 GS06 / ST02 含非 ASCII、分隔符或控制字符 |
+| `ACK_ENVELOPE_UNUSABLE` | 外壳可解析但收发方或 GS06/ST02 无法提取 |
+| （其余） | 来报核验的原始错误码，如 `MISSING_SEGMENT`、`TRAILING_DATA` 等 |
+
+调用示例：
+
+```bash
+curl -s http://localhost:8080/v1/acknowledge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "edi_text": "ISA*00*          *00*          *ZZ*SENDER123456789*ZZ*RECEIVER1234567*000830*1200*U*00401*000000001*0*P*:~GS*IN*SENDERGS*RECVGS*20200830*1200*42*X*004010~ST*810*0001~BIG*20200830*INV1~IT1*1*10*EA*19.99~TDS*19990~SE*5*0001~GE*1*42~IEA*1*000000001~",
+    "isa13": "000000002",
+    "gs06": "43",
+    "st02": "0002"
+  }'
+```
+
 ## 核验规则
 
 报文结构（顺序固定，各 1 份，`IT1` 为 1～100 个）：
@@ -228,8 +298,10 @@ pytest -q
 app/main.py        FastAPI 路由、请求/响应模型、422 异常处理
 app/verifier.py    ISA 分隔符解析、外壳状态机、整数定点金额核验
 app/reconciler.py  采购单校验与多发票逐张核销（整数毫单位，无浮点）
-tests/test_verify.py     /v1/verify 端到端/单元测试（39 个）
-tests/test_reconcile.py  /v1/reconcile 端到端测试（25 个）
+app/acknowledger.py 外壳可回执性提取与 004010 X12 997 回执生成
+tests/test_verify.py      /v1/verify 端到端/单元测试（39 个）
+tests/test_reconcile.py   /v1/reconcile 端到端测试（25 个）
+tests/test_acknowledge.py /v1/acknowledge 端到端测试（13 个）
 Dockerfile         python:3.12-slim 镜像，以 nobody 运行
 docker-compose.yml 映射 8080 端口，含 /health 健康检查
 ```
